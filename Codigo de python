@@ -1,0 +1,317 @@
+Código Funcional Python:
+
+import time
+import cv2
+import numpy as np
+import serial
+import serial.tools.list_ports
+
+# -------- CONFIGURACION --------
+
+CAMARA_INDICE, PUERTO_SERIAL, BAUDIOS = 1, "COM3", 115200
+AREA_MIN, EPSILON = 1500, 0.025
+
+ANGULO_TOL, TOL_ASPECTO = 18, 0.18
+CUADRADO_RELLENO_MIN = 0.85
+TRIANGULO_RELLENO_MIN, TRIANGULO_LADO_MIN = 0.80, 0.20
+CIRCULARIDAD_MIN, RELLENO_CIRCULO_MIN = 0.82, 0.82
+VARIACION_RADIO_MAX, RELACION_ELIPSE_MIN = 0.12, 0.82
+
+FRAMES_ESTABLES = 6          # Frames consecutivos para confirmar figura
+FRAMES_SIN_FIGURA = 8        # Frames vacios para resetear lectura
+TIMEOUT_SEGURIDAD_S = 7.0    # Respaldo por si el ESP32 no responde READY
+
+DESTINO = {"Cuadrado": "L", "Triangulo": "R", "Circulo": "C"}
+NOMBRE_DESTINO = {"L": "IZQUIERDA (30°)", "C": "CENTRO (90°)", "R": "DERECHA (150°)"}
+COLORES = {
+    "Circulo": (0, 200, 0),
+    "Cuadrado": (255, 100, 0),
+    "Triangulo": (200, 0, 200)
+}
+
+
+# -------- CLASIFICACION GEOMETRICA --------
+
+def angulo(p0, p1, p2):
+    v1, v2 = p0 - p1, p2 - p1
+    d = np.linalg.norm(v1) * np.linalg.norm(v2)
+    return np.degrees(np.arccos(np.clip(np.dot(v1, v2) / d, -1, 1))) if d else 0
+
+
+def es_cuadrado(hull, aprox, area):
+    (_, _), (w, h), _ = cv2.minAreaRect(hull)
+    if not w or not h or len(aprox) != 4:
+        return False
+    if min(w, h) / max(w, h) < 1 - TOL_ASPECTO or area / (w * h) < CUADRADO_RELLENO_MIN:
+        return False
+    pts = aprox.reshape(-1, 2).astype(float)
+    return all(abs(angulo(pts[i-1], pts[i], pts[(i+1) % 4]) - 90) <= ANGULO_TOL
+               for i in range(4))
+
+
+def es_triangulo(hull, area):
+    if len(hull) < 3:
+        return False
+    _, tri = cv2.minEnclosingTriangle(hull)
+    if tri is None:
+        return False
+    tri = tri.reshape(-1, 2)
+    area_tri = cv2.contourArea(tri)
+    if not area_tri or area / area_tri < TRIANGULO_RELLENO_MIN:
+        return False
+    lados = [np.linalg.norm(tri[i] - tri[(i+1) % 3]) for i in range(3)]
+    return min(lados) / max(lados) >= TRIANGULO_LADO_MIN
+
+
+def es_circulo(hull, area, perimetro):
+    if 4 * np.pi * area / perimetro**2 < CIRCULARIDAD_MIN:
+        return False
+    (cx, cy), radio = cv2.minEnclosingCircle(hull)
+    if radio <= 0 or area / (np.pi * radio**2) < RELLENO_CIRCULO_MIN:
+        return False
+    dist = np.linalg.norm(hull.reshape(-1, 2) - [cx, cy], axis=1)
+    if dist.mean() == 0 or dist.std() / dist.mean() > VARIACION_RADIO_MAX:
+        return False
+    if len(hull) >= 5:
+        (_, _), (a, b), _ = cv2.fitEllipse(hull)
+        if not a or not b or min(a, b) / max(a, b) < RELACION_ELIPSE_MIN:
+            return False
+    return True
+
+
+def clasificar_forma(cnt):
+    hull = cv2.convexHull(cnt)
+    area, perimetro = cv2.contourArea(hull), cv2.arcLength(hull, True)
+    if not area or not perimetro:
+        return None
+
+    aprox = cv2.approxPolyDP(hull, EPSILON * perimetro, True)
+
+    if es_triangulo(hull, area):
+        return "Triangulo"
+    if es_cuadrado(hull, aprox, area):
+        return "Cuadrado"
+    if len(aprox) > 6 and es_circulo(hull, area, perimetro):
+        return "Circulo"
+    return None
+
+
+# -------- PROCESAMIENTO DE IMAGEN --------
+
+def preprocesar(frame):
+    gris = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    filtrada = cv2.bilateralFilter(gris, 9, 75, 75)
+
+    mascara = cv2.adaptiveThreshold(
+        filtrada, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 31, 7
+    )
+
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+    mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN, k3)
+    mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, k5, iterations=2)
+
+    bordes = cv2.Canny(filtrada, 50, 150)
+    procesada = cv2.bitwise_or(mascara, cv2.bitwise_and(bordes, mascara))
+
+    return procesada, mascara, bordes
+
+
+# -------- COMUNICACION ESP32 --------
+
+def conectar_esp32():
+    try:
+        ser = serial.Serial(PUERTO_SERIAL, BAUDIOS, timeout=0.05)
+        time.sleep(2)
+        ser.reset_input_buffer()
+        print(f"ESP32 conectado en {PUERTO_SERIAL}")
+        return ser
+    except serial.SerialException as e:
+        puertos = [p.device for p in serial.tools.list_ports.comports()]
+        print(f"Error serial: {e}\nPuertos disponibles: {puertos}")
+        print("Continuando en modo simulacion (sin ESP32).")
+        return None
+
+
+def enviar(ser, codigo):
+    if codigo not in NOMBRE_DESTINO:
+        return False
+
+    print(f"-> Enviando {codigo}: {NOMBRE_DESTINO[codigo]}")
+    if ser:
+        try:
+            ser.reset_input_buffer()
+            ser.write(codigo.encode("ascii"))
+            ser.flush()
+            return True
+        except (serial.SerialException, OSError) as e:
+            print(f"Error serial al enviar: {e}")
+            return False
+    return True  # En modo sin ESP32 simula envio exitoso
+
+
+def revisar_estado_esp32(ser, ocupado_actual, t_envio):
+    """
+    Lee mensajes del ESP32. Retorna True si sigue ocupado, False si ya esta READY.
+    """
+    if not ser:
+        # Simulacion de 5 segundos si no hay placa conectada
+        if ocupado_actual and (time.time() - t_envio >= 5.0):
+            print("<- [SIMULACION] READY")
+            return False
+        return ocupado_actual
+
+    try:
+        while ser.in_waiting:
+            linea = ser.readline().decode(errors="ignore").strip()
+            if not linea:
+                continue
+            print(f"<- ESP32: {linea}")
+            if "READY" in linea:
+                return False
+            elif "BUSY" in linea:
+                ocupado_actual = True
+    except (serial.SerialException, OSError) as e:
+        print(f"Error de lectura serial: {e}")
+
+    # Respaldo de seguridad por si se pierde el mensaje READY
+    if ocupado_actual and (time.time() - t_envio >= TIMEOUT_SEGURIDAD_S):
+        print("<- [TIMEOUT] Liberando bloqueo por seguridad.")
+        return False
+
+    return ocupado_actual
+
+
+# -------- PROGRAMA PRINCIPAL --------
+
+def main():
+    ser = conectar_esp32()
+    cap = cv2.VideoCapture(CAMARA_INDICE, cv2.CAP_DSHOW)
+
+    if not cap.isOpened():
+        print(f"No se pudo abrir la camara {CAMARA_INDICE}.")
+        if ser:
+            ser.close()
+        return
+
+    ultima_forma = None
+    estable = 0
+    sin_figura = 0
+
+    esp32_ocupado = False
+    t_envio = 0.0
+    ultima_accion = ""
+    mostrar = True
+
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            # 1. Consultar si el ESP32 ya termino sus 5s y volvio a posicion inicial
+            estaba_ocupado = esp32_ocupado
+            esp32_ocupado = revisar_estado_esp32(ser, esp32_ocupado, t_envio)
+
+            # Si acaba de pasar de OCUPADO -> LIBRE, reiniciar contadores de deteccion
+            if estaba_ocupado and not esp32_ocupado:
+                ultima_forma = None
+                estable = 0
+                sin_figura = 0
+
+            # 2. Procesar vision artificial
+            procesada, mascara, bordes = preprocesar(frame)
+            contornos, _ = cv2.findContours(
+                procesada, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            figuras = []
+            for cnt in contornos:
+                area = cv2.contourArea(cnt)
+                if area < AREA_MIN:
+                    continue
+
+                hull = cv2.convexHull(cnt)
+                area_hull = cv2.contourArea(hull)
+                if not area_hull or area / area_hull < 0.80:
+                    continue
+
+                forma = clasificar_forma(cnt)
+                if forma:
+                    figuras.append((area, forma, cnt))
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    color = COLORES[forma]
+                    cv2.drawContours(frame, [cnt], -1, color, 2)
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), color, 1)
+                    cv2.putText(frame, forma, (x, y-8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            # 3. Logica de decision sincronizada con el servo
+            if esp32_ocupado:
+                transcurrido = time.time() - t_envio
+                estado_texto = f"CLASIFICANDO: {ultima_accion} ({transcurrido:.1f}s / 5.0s)"
+                color_estado = (0, 165, 255)  # Naranja (ocupado)
+            else:
+                color_estado = (0, 255, 255)  # Amarillo (listo)
+                if figuras:
+                    sin_figura = 0
+                    _, forma, _ = max(figuras, key=lambda f: f[0])
+
+                    if forma == ultima_forma:
+                        estable += 1
+                    else:
+                        ultima_forma = forma
+                        estable = 1
+
+                    estado_texto = f"Detectando: {forma} ({estable}/{FRAMES_ESTABLES})"
+
+                    # Confirmar deteccion y disparar servo
+                    if estable >= FRAMES_ESTABLES:
+                        codigo = DESTINO[forma]
+                        if enviar(ser, codigo):
+                            esp32_ocupado = True
+                            t_envio = time.time()
+                            ultima_accion = f"{forma} -> {NOMBRE_DESTINO[codigo]}"
+                            estado_texto = f"ENVIADO: {ultima_accion}"
+                else:
+                    sin_figura += 1
+                    if sin_figura >= FRAMES_SIN_FIGURA:
+                        ultima_forma = None
+                        estable = 0
+                    estado_texto = "LISTO: Esperando objeto en banda..."
+
+            # 4. Interfaz visual
+            cv2.putText(frame, estado_texto, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_estado, 2)
+
+            cv2.putText(frame, "ESP32 CONECTADO" if ser else "MODO SIMULACION (SIN ESP32)",
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (0, 255, 0) if ser else (0, 0, 255), 2)
+
+            cv2.imshow("Clasificador", frame)
+
+            if mostrar:
+                cv2.imshow("Segmentacion", mascara)
+                cv2.imshow("Bordes Canny", bordes)
+                cv2.imshow("Imagen procesada", procesada)
+
+            tecla = cv2.waitKey(1) & 0xFF
+            if tecla == ord("q"):
+                break
+            elif tecla == ord("m"):
+                mostrar = not mostrar
+                if not mostrar:
+                    for ventana in ["Segmentacion", "Bordes Canny", "Imagen procesada"]:
+                        cv2.destroyWindow(ventana)
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        if ser:
+            ser.close()
+
+
+if __name__ == "__main__":
+    main()
