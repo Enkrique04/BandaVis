@@ -1,0 +1,112 @@
+#include <ESP32Servo.h>
+
+// -------- CONFIGURACION --------
+const int PIN_SERVO = 18;
+const long BAUDIOS = 115200;
+
+// Ajusta estos angulos segun la mecanica de tu compuerta
+const int ANGULO_INICIAL   = 90;   // Posicion de reposo / Circulo
+const int ANGULO_IZQUIERDA = 30;   // Cuadrado
+const int ANGULO_DERECHA   = 150;  // Triangulo
+
+const int PULSO_MIN = 500;
+const int PULSO_MAX = 2400;
+
+const int RETARDO_PASO_MS = 8;               // Velocidad de giro (menor = mas rapido)
+const unsigned long TIEMPO_ESPERA_MS = 5000; // 5 segundos exactos en posicion
+
+Servo servo;
+int anguloActual = ANGULO_INICIAL;
+
+bool ocupado = false;
+unsigned long tInicioEspera = 0;
+
+// -------- FUNCIONES --------
+
+void moverSuave(int objetivo) {
+  int paso = (objetivo > anguloActual) ? 1 : -1;
+  while (anguloActual != objetivo) {
+    anguloActual += paso;
+    servo.write(anguloActual);
+    delay(RETARDO_PASO_MS);
+  }
+}
+
+void iniciarClasificacion(int anguloObjetivo, const char* etiqueta) {
+  ocupado = true;
+  
+  // 1. Mover al angulo de clasificacion
+  moverSuave(anguloObjetivo);
+  
+  // 2. Iniciar cronometro de 5 segundos una vez alcanzada la posicion
+  tInicioEspera = millis();
+
+  Serial.print("BUSY:");
+  Serial.println(etiqueta);
+}
+
+void finalizarClasificacion() {
+  // 1. Regresar a la posicion inicial (90 grados)
+  moverSuave(ANGULO_INICIAL);
+
+  // 2. Limpiar cualquier basura que haya llegado por Serial durante los 5s
+  while (Serial.available() > 0) {
+    Serial.read();
+  }
+
+  ocupado = false;
+  
+  // 3. Avisar a Python que el servo ya volvio a 90° y esta listo
+  Serial.println("READY");
+}
+
+void procesarComando(char cmd) {
+  switch (cmd) {
+    case 'L': iniciarClasificacion(ANGULO_IZQUIERDA, "IZQUIERDA_CUADRADO"); break;
+    case 'C': iniciarClasificacion(ANGULO_INICIAL,   "CENTRO_CIRCULO");     break;
+    case 'R': iniciarClasificacion(ANGULO_DERECHA,   "DERECHA_TRIANGULO");  break;
+    default: break; // Ignora saltos de linea (\n, \r) o caracteres invalidos
+  }
+}
+
+// -------- SETUP / LOOP --------
+
+void setup() {
+  Serial.begin(BAUDIOS);
+
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
+  servo.setPeriodHertz(50);
+  servo.attach(PIN_SERVO, PULSO_MIN, PULSO_MAX);
+  
+  // Posicionar en el centro y MANTENER energizado para sostener la compuerta
+  servo.write(ANGULO_INICIAL);
+  anguloActual = ANGULO_INICIAL;
+  delay(500);
+
+  Serial.println("READY");
+}
+
+void loop() {
+  if (ocupado) {
+    // Descartar comandos mientras el servo esta sosteniendo la posicion
+    while (Serial.available() > 0) {
+      Serial.read();
+    }
+
+    // Verificar si ya pasaron los 5 segundos
+    if (millis() - tInicioEspera >= TIEMPO_ESPERA_MS) {
+      finalizarClasificacion();
+    }
+    return;
+  }
+
+  // Si esta libre, escuchar nuevo comando
+  if (Serial.available() > 0) {
+    char cmd = Serial.read();
+    procesarComando(cmd);
+  }
+}
